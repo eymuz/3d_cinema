@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Babylon Multiplayer Test</title>
+  <style>
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+    canvas { width: 100%; height: 100%; display: block; }
+  </style>
+  <script src="https://cdn.babylonjs.com/babylon.js"></script>
+</head>
+<body>
+<canvas id="renderCanvas"></canvas>
+<script>
+(async function() {
+  const socket = new WebSocket("https://nodeserver-yzja.onrender.com/");
+
+  const canvas = document.getElementById("renderCanvas");
+  const engine = new BABYLON.Engine(canvas, true);
+  const scene = new BABYLON.Scene(engine);
+
+  // Kamera
+  const camera = new BABYLON.FreeCamera("camera1", new BABYLON.Vector3(0, 5, -10), scene);
+  camera.setTarget(BABYLON.Vector3.Zero());
+  camera.attachControl(canvas, true);
+
+  // Işık
+  new BABYLON.HemisphericLight("light1", new BABYLON.Vector3(1, 1, 0), scene);
+
+  // Zemin
+  BABYLON.MeshBuilder.CreateGround("ground", {width: 20, height: 20}, scene);
+
+  // Bizim karakter (mavi küp)
+  const myChar = BABYLON.MeshBuilder.CreateBox("myChar", {size: 1}, scene);
+  myChar.position.y = 0.5;
+  const myMat = new BABYLON.StandardMaterial("mymat", scene);
+  myMat.diffuseColor = new BABYLON.Color3(0, 0, 1);
+  myChar.material = myMat;
+
+  const myId = Math.floor(Math.random() * 1000000).toString();
+  const otherChars = {};
+
+  const keys = {};
+  window.addEventListener("keydown", (e) => keys[e.key] = true);
+  window.addEventListener("keyup", (e) => keys[e.key] = false);
+
+  scene.onBeforeRenderObservable.add(() => {
+    let moved = false;
+    if (keys["w"]) { myChar.position.z += 0.1; moved = true; }
+    if (keys["s"]) { myChar.position.z -= 0.1; moved = true; }
+    if (keys["a"]) { myChar.position.x -= 0.1; moved = true; }
+    if (keys["d"]) { myChar.position.x += 0.1; moved = true; }
+
+    if (moved && socket.readyState === WebSocket.OPEN) {
+      const msg = `character=${myId},${myChar.position.x.toFixed(2)},${myChar.position.y.toFixed(2)},${myChar.position.z.toFixed(2)}`;
+      socket.send(msg);
+    }
+  });
+
+  socket.onmessage = (event) => {
+    const msg = event.data;
+    if (msg.startsWith("character=")) {
+      const parts = msg.split("=")[1].split(",");
+      const [id, x, y, z] = [parts[0], ...parts.slice(1).map(Number)];
+      if (id === myId) return;
+
+      if (!otherChars[id]) {
+        const char = BABYLON.MeshBuilder.CreateBox("char_" + id, {size: 1}, scene);
+        char.position.y = 0.5;
+        const mat = new BABYLON.StandardMaterial("mat_" + id, scene);
+        mat.diffuseColor = new BABYLON.Color3(1, 0, 0);
+        char.material = mat;
+        otherChars[id] = char;
+      }
+      otherChars[id].position.set(x, y, z);
+    }
+  };
+
+  engine.runRenderLoop(() => scene.render());
+  window.addEventListener("resize", () => engine.resize());
+})();
+</script>
+</body>
+</html>
