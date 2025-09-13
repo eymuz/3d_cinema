@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8" />
+  <title>WebVerse Multiplayer + Mod Loader</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Babylon & JSZip -->
+  <script src="https://cdn.babylonjs.com/babylon.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <style>
+    html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#000; }
+    #renderCanvas { width:100%; height:100%; touch-action:none; display:block; }
+    #log { position:absolute; top:8px; left:8px; right:8px; max-height:30vh; overflow:auto;
+           color:#0f0; font:12px/1.3 monospace; background:rgba(0,0,0,.45); padding:8px; border-radius:6px; }
+    #fileInput { display:none; }
+  </style>
+</head>
+<body>
+  <canvas id="renderCanvas"></canvas>
+  <div id="log">Q: .any mod yükle • WASD: hareket • Space: zıpla</div>
+  <input id="fileInput" type="file" accept=".any,.zip" />
+
+<script>
+/* ====================== Yardımcılar ====================== */
+const logBox = document.getElementById("log");
+function log(msg){ logBox.textContent += "\n" + msg; logBox.scrollTop = logBox.scrollHeight; }
+
+function randId(){ return "id" + Math.floor(Math.random()*1e9); }
+function randColor(){ return [Math.random(), Math.random(), Math.random()]; }
+function snap2(v){ return Math.round(v/2)*2; } // 2'lik blok ızgarası
+
+/* ====================== Global RAM (modlar için) ====================== */
+window.RAM = Object.create(null);   // RAM["path/in/zip"] => string (text) ya da dataURL (binary)
+window.getRAM = (p)=> RAM[p];       // modların kolay erişimi için
+
+/* ====================== Babylon Sahne ====================== */
+const canvas = document.getElementById("renderCanvas");
+const engine = new BABYLON.Engine(canvas, true, { preserveDrawingBuffer:true, stencil:true });
+const scene  = new BABYLON.Scene(engine);
+scene.clearColor = new BABYLON.Color3(0,0,0);
+
+// ışık & zemin
+new BABYLON.HemisphericLight("light", new BABYLON.Vector3(0,1,0), scene);
+const ground = BABYLON.MeshBuilder.CreateGround("ground", { width: 200, height: 200 }, scene);
+
+// Bizim karakter
+const myColor = randColor();
+const myId    = randId();
+const myChar  = BABYLON.MeshBuilder.CreateBox("me", { size: 2 }, scene);
+myChar.position.y = 1;
+myChar.material = new BABYLON.StandardMaterial("meMat", scene);
+myChar.material.diffuseColor = new BABYLON.Color3(...myColor);
+let charRot = 0;
+
+// Kamera: sabit arkadan takip (fare dönmez)
+const camera = new BABYLON.FreeCamera("cam", new BABYLON.Vector3(0, 6, -12), scene);
+camera.inputs.clear(); // fare/klavye girdilerini kapat
+camera.setTarget(myChar.position);
+
+// Klavye
+const keys = {};
+addEventListener("keydown", (e)=>{
+  keys[e.key.toLowerCase()] = true;
+  if(e.key.toLowerCase()==="q"){ document.getElementById("fileInput").click(); } // Q -> mod seç
+});
+addEventListener("keyup",   (e)=> keys[e.key.toLowerCase()] = false);
+
+// Hareket fiziği basit
+let vy = 0; let onGround = true;
+
+/* ====================== WebSocket İstemcisi ====================== */
+const WS_URL = "wss://nodeserver-yzja.onrender.com/"; // ← BURAYI KENDI ADRESINLE DEGISTIR
+let ws;
+function connectWS(){
+  try{
+    ws = new WebSocket(WS_URL);
+    ws.onopen    = ()=> log("WS: bağlandı");
+    ws.onclose   = ()=> { log("WS: kapandı, 2sn sonra tekrar denenecek"); setTimeout(connectWS, 2000); };
+    ws.onerror   = (e)=> log("WS: hata " + (e?.message||""));
+    ws.onmessage = onWSMessage;
+  }catch(err){ log("WS bağlanma hatası: " + err); }
+}
+connectWS();
+
+// Oyuncu koleksiyonu
+const chars = Object.create(null);     // id -> mesh
+const targets = Object.create(null);   // id -> {pos: Vector3, rot?: number}
+const lastSeen = Object.create(null);  // id -> timestamp(ms)
+
+// Mesaj işleme
+function onWSMessage(ev){
+  const raw = ev.data.toString();
+  // mod=... → eval
+  if(raw.startsWith("mod=")){
+    const code = raw.slice(4);
+    try{ eval(code); } catch(e){ log("mod eval error: " + e); }
+    return;
+  }
+  // id=... → oyuncu bilgisi
+  if(raw.includes("=")){
+    const [id, rest] = raw.split("=");
+    const parts = rest.split(",");
+    if(parts.length === 6 || parts.length === 7){
+      const x = parseFloat(parts[0]), y = parseFloat(parts[1]), z = parseFloat(parts[2]);
+      const r = parseFloat(parts[3]), g = parseFloat(parts[4]), b = parseFloat(parts[5]);
+      const rot = (parts.length === 7) ? parseFloat(parts[6]) : undefined;
+
+      if(id !== myId){
+        // spawn yoksa oluştur
+        if(!chars[id]){
+          const m = BABYLON.MeshBuilder.CreateBox(id, { size: 2 }, scene);
+          m.position.set(x,y,z);
+          m.material = new BABYLON.StandardMaterial("mat_"+id, scene);
+          m.material.diffuseColor = new BABYLON.Color3(r,g,b);
+          chars[id] = m;
+        }
+        // renk güncelle
+        if(chars[id].material && chars[id].material.diffuseColor){
+          chars[id].material.diffuseColor.set(r,g,b);
+        }
+        // hedef konum & rot kaydet
+        targets[id] = { pos: new BABYLON.Vector3(x,y,z), rot };
+        lastSeen[id] = performance.now();
+      }
+      return;
+    }
+  }
+  // Diğer her şey → eval
+  try{ eval(raw); } catch(e){ log("eval error: " + e); }
+}
+
+/* ====================== Render Döngüsü ====================== */
+const SEND_INTERVAL_MS = 100; // 10 Hz
+let   lastSend = 0;
+
+engine.runRenderLoop(()=>{
+  // hareket
+  const speed = 0.30;
+  if(keys["w"]){ myChar.position.x += Math.sin(charRot) * speed; myChar.position.z += Math.cos(charRot) * speed; }
+  if(keys["s"]){ myChar.position.x -= Math.sin(charRot) * speed; myChar.position.z -= Math.cos(charRot) * speed; }
+  if(keys["a"]){ charRot -= 0.05; }
+  if(keys["d"]){ charRot += 0.05; }
+  myChar.rotation.y = charRot;
+
+  // zıplama
+  if(keys[" "] && onGround){ vy = 0.40; onGround = false; }
+  vy -= 0.018;
+  myChar.position.y += vy;
+  if(myChar.position.y <= 1){ myChar.position.y = 1; vy = 0; onGround = true; }
+
+  // kamera arkadan takip
+  const dist=12, h=6;
+  camera.position.x = myChar.position.x - Math.sin(charRot)*dist;
+  camera.position.z = myChar.position.z - Math.cos(charRot)*dist;
+  camera.position.y = myChar.position.y + h;
+  camera.setTarget(myChar.position.clone().add(new BABYLON.Vector3(0,1,0)));
+
+  // diğer oyuncuları yumuşak taşı
+  for(const id in chars){
+    const t = targets[id];
+    if(t){
+      chars[id].position = BABYLON.Vector3.Lerp(chars[id].position, t.pos, 0.18);
+      if(typeof t.rot === "number") chars[id].rotation.y = t.rot;
+    }
+  }
+
+  // 45sn görünmeyeni sil
+  const now = performance.now();
+  for(const id in lastSeen){
+    if(now - lastSeen[id] > 45000){
+      chars[id]?.dispose();
+      delete chars[id]; delete targets[id]; delete lastSeen[id];
+      log("despawn: " + id);
+    }
+  }
+
+  // Konumu 10Hz ile gönder (blok ızgarasına yuvarlanmış)
+  if(ws && ws.readyState === WebSocket.OPEN && now - lastSend >= SEND_INTERVAL_MS){
+    lastSend = now;
+    const bx = snap2(myChar.position.x);
+    const by = snap2(myChar.position.y);
+    const bz = snap2(myChar.position.z);
+    ws.send(`${myId}=${bx},${by},${bz},${myColor[0]},${myColor[1]},${myColor[2]},${charRot.toFixed(3)}`);
+  }
+
+  scene.render();
+});
+
+addEventListener("resize", ()=> engine.resize());
+
+/* ====================== Q: .any Mod Yükleme (JSZip) ====================== */
+document.getElementById("fileInput").addEventListener("change", async (ev)=>{
+  const file = ev.target.files[0];
+  if(!file) return;
+  log("Yükleniyor: " + file.name);
+
+  try{
+    const data = await file.arrayBuffer();
+    const zip  = await JSZip.loadAsync(data);
+
+     // ZIP içindeki *tüm* dosyaları RAM'e yaz
+    window.RAM = zip;
+    const names = Object.keys(zip.files);
+    for(const name of names){
+      const entry = zip.files[name];
+      if(entry.dir) continue;
+
+      // binary mi text mi?
+      if(/\.(png|jpe?g|gif|bmp|webp|mp4|mp3|ogg|wav|webm|glb|gltf|bin)$/i.test(name)){
+        const b64 = await entry.async("base64");
+        RAM[name] = "data:application/octet-stream;base64," + b64;
+      }else{
+        RAM[name] = await entry.async("string");
+      }
+      // küçük bir log
+      if(name.length < 120) log("RAM → " + name);
+      else log("RAM → " + name.slice(0,120)+"...");
+    }
+
+    // src/main/mod.js var ise eval et
+    if(RAM["src/main/mod.js"]){
+      log("mod.js çalıştırılıyor…");
+      try{
+        eval(RAM["src/main/mod.js"]);
+        log("mod.js OK");
+      }catch(e){ log("mod.js HATA: " + e); }
+    }else{
+      log("UYARI: src/main/mod.js bulunamadı!");
+    }
+  }catch(e){
+    log("ANY yükleme hatası: " + e);
+  }finally{
+    // input'u temizle (aynı dosyayı tekrar seçebilmek için)
+    ev.target.value = "";
+  }
+});
+</script>
+</body>
+</html>
